@@ -4,6 +4,7 @@ import shutil
 import asyncio
 import random
 import traceback
+import json
 import discord
 from discord.ext import commands
 import config
@@ -11,6 +12,7 @@ import config
 LARGE_MEDIA    = ""
 CONTENT_FOLDER = ""
 LOG_FILE       = ""
+TC_STATE_FILE  = "./tc_state.json"
 
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 MAX_RETRIES   = 5
@@ -41,43 +43,68 @@ def night_multiplier():
 async def human_sleep(min_s=1.0, max_s=3.5):
     await asyncio.sleep(random.uniform(min_s, max_s) * night_multiplier())
 
-# ── RETRY WITH BACKOFF ────────────────────────────────────────
+# ── TC CHECKPOINT (resume after restart) ──────────────────────
+
+def save_tc_state(source_id, target_id, batch_size, last_message_id, transferred):
+    state = {
+        "source_id":      source_id,
+        "target_id":      target_id,
+        "batch_size":     batch_size,
+        "last_message_id": last_message_id,
+        "transferred":    transferred,
+    }
+    with open(TC_STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+def load_tc_state():
+    if os.path.exists(TC_STATE_FILE):
+        try:
+            with open(TC_STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+def clear_tc_state():
+    if os.path.exists(TC_STATE_FILE):
+        os.remove(TC_STATE_FILE)
+
+# ── RETRY HELPERS ─────────────────────────────────────────────
 
 async def safe_send(channel, *, content=None, files=None, attempt=0):
-    """Send a message with automatic retry on rate limits and transient errors."""
     try:
-        return await channel.send(
-            content=content,
-            files=files or [],
-        )
+        return await channel.send(content=content, files=files or [])
     except discord.HTTPException as e:
         if e.status == 429:
-            retry_after = float(e.response.headers.get("Retry-After", 5)) if hasattr(e, 'response') and e.response else 5
-            retry_after = max(retry_after, 2) + random.uniform(0.5, 2.0)
-            log_warn(f"Rate limited (429). Waiting {retry_after:.1f}s before retry (attempt {attempt+1}/{MAX_RETRIES})...")
+            retry_after = 5 + random.uniform(0.5, 2.0)
+            try:
+                retry_after = float(e.response.headers.get("Retry-After", 5)) + random.uniform(0.5, 2.0)
+            except Exception:
+                pass
+            log_warn(f"Rate limited (429). Waiting {retry_after:.1f}s (attempt {attempt+1}/{MAX_RETRIES})...")
             await asyncio.sleep(retry_after)
             if attempt < MAX_RETRIES:
                 return await safe_send(channel, content=content, files=files, attempt=attempt + 1)
-            log_error(f"Max retries reached on rate limit — skipping message.")
+            log_error("Max retries on rate limit — skipping.")
             return None
         elif e.status in (500, 502, 503, 504):
             wait = (2 ** attempt) + random.uniform(0, 1)
-            log_warn(f"Discord server error {e.status}. Retrying in {wait:.1f}s (attempt {attempt+1}/{MAX_RETRIES})...")
+            log_warn(f"Server error {e.status}. Retrying in {wait:.1f}s...")
             await asyncio.sleep(wait)
             if attempt < MAX_RETRIES:
                 return await safe_send(channel, content=content, files=files, attempt=attempt + 1)
-            log_error(f"Max retries reached on server error — skipping message.")
+            log_error("Max retries on server error — skipping.")
             return None
         else:
-            log_error(f"HTTP {e.status} sending message: {e.text}")
+            log_error(f"HTTP {e.status}: {e.text}")
             return None
     except (asyncio.TimeoutError, discord.ConnectionClosed) as e:
         wait = (2 ** attempt) + random.uniform(0, 1)
-        log_warn(f"Connection issue: {type(e).__name__}. Retrying in {wait:.1f}s (attempt {attempt+1}/{MAX_RETRIES})...")
+        log_warn(f"Connection issue: {type(e).__name__}. Retrying in {wait:.1f}s...")
         await asyncio.sleep(wait)
         if attempt < MAX_RETRIES:
             return await safe_send(channel, content=content, files=files, attempt=attempt + 1)
-        log_error("Max retries reached on connection error — skipping message.")
+        log_error("Max retries on connection error — skipping.")
         return None
     except Exception as e:
         log_error(f"Unexpected error in safe_send: {e}")
@@ -85,7 +112,6 @@ async def safe_send(channel, *, content=None, files=None, attempt=0):
         return None
 
 async def safe_fetch_file(attachment, attempt=0):
-    """Download an attachment with retry."""
     try:
         return await attachment.to_file()
     except discord.HTTPException as e:
@@ -218,9 +244,78 @@ async def send_media_in_batches(channel, batch_size=1):
 
     log_ok(f"Upload done — uploaded: {uploaded} | failed: {failed} | total: {total}")
 
-# ── CLONE (single category) ───────────────────────────────────
+# ── TC WITH RESUME ────────────────────────────────────────────
 
-async def clone_category(source_cat: discord.CategoryChannel, target_cat: discord.CategoryChannel, guild: discord.Guild):
+async def run_tc(src, dst, batch_size, resume_after_id=None, already_transferred=0):
+    source_id = src.id
+    target_id = dst.id
+    file_batch = []
+    total      = already_transferred
+    skipped    = 0
+    last_msg_id = resume_after_id
+
+    log_info(f"Transfer: #{src.name} -> #{dst.name} (batch={batch_size})" +
+             (f" | Resuming after message {resume_after_id}" if resume_after_id else ""))
+
+    try:
+        kwargs = {"limit": None, "oldest_first": True}
+        if resume_after_id:
+            kwargs["after"] = discord.Object(id=resume_after_id)
+
+        async for msg in src.history(**kwargs):
+            for att in msg.attachments:
+                if att.size > MAX_FILE_SIZE:
+                    log_warn(f"Skipped oversized {att.filename} ({att.size/1024/1024:.1f} MB)")
+                    skipped += 1
+                    continue
+
+                f = await safe_fetch_file(att)
+                if f:
+                    file_batch.append(f)
+                else:
+                    skipped += 1
+
+                if len(file_batch) >= batch_size:
+                    result = await safe_send(dst, files=file_batch)
+                    if result:
+                        total += len(file_batch)
+                        log_info(f"Sent {len(file_batch)} file(s) (total: {total})")
+                    file_batch = []
+                    # Save checkpoint after every successful batch
+                    last_msg_id = msg.id
+                    save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
+                    await human_sleep(1.5, 4.0)
+
+            last_msg_id = msg.id
+
+        # Send remaining files
+        if file_batch:
+            result = await safe_send(dst, files=file_batch)
+            if result:
+                total += len(file_batch)
+            file_batch = []
+
+    except discord.Forbidden:
+        log_error(f"No permission to read #{src.name}")
+    except discord.HTTPException as e:
+        log_error(f"HTTP {e.status} reading history: {e.text}")
+        save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
+        log_warn("State saved — will resume from here on next restart.")
+        return
+    except Exception as e:
+        log_error(f"Unexpected error during transfer: {e}")
+        log_error(traceback.format_exc())
+        save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
+        log_warn("State saved — will resume from here on next restart.")
+        return
+
+    # Done — clear checkpoint
+    clear_tc_state()
+    log_ok(f"Transfer complete — total: {total} | skipped: {skipped}")
+
+# ── CLONE ─────────────────────────────────────────────────────
+
+async def clone_category(source_cat, target_cat, guild):
     log_info(f"Cloning '{source_cat.name}' ({source_cat.id}) -> '{target_cat.name}' ({target_cat.id})")
 
     existing  = {c.name.lower() for c in target_cat.text_channels}
@@ -238,7 +333,6 @@ async def clone_category(source_cat: discord.CategoryChannel, target_cat: discor
             skipped += 1
             continue
 
-        # Create channel
         new_ch = None
         for attempt in range(MAX_RETRIES):
             try:
@@ -248,28 +342,26 @@ async def clone_category(source_cat: discord.CategoryChannel, target_cat: discor
                 break
             except discord.HTTPException as e:
                 if e.status == 429:
-                    wait = float(e.response.headers.get("Retry-After", 5)) if hasattr(e, 'response') and e.response else 5
+                    wait = 5 + random.uniform(0.5, 2)
                     log_warn(f"Rate limited creating #{ch.name}. Waiting {wait:.1f}s...")
-                    await asyncio.sleep(wait + random.uniform(0.5, 2))
+                    await asyncio.sleep(wait)
                 elif e.status == 403:
                     log_error(f"No permission to create #{ch.name} — skipping")
                     skipped += 1
                     break
                 else:
                     log_error(f"HTTP {e.status} creating #{ch.name}: {e.text}")
+                    await asyncio.sleep(2 ** attempt)
                     if attempt == MAX_RETRIES - 1:
                         skipped += 1
-                    await asyncio.sleep(2 ** attempt)
             except Exception as e:
                 log_error(f"Error creating #{ch.name}: {e}")
-                log_error(traceback.format_exc())
                 skipped += 1
                 break
 
         if not new_ch:
             continue
 
-        # Copy messages
         log_info(f"Copying messages from #{ch.name}...")
         msg_count = 0
 
@@ -286,7 +378,6 @@ async def clone_category(source_cat: discord.CategoryChannel, target_cat: discor
                     if f:
                         files.append(f)
 
-                # Send attachments in chunks of 10
                 if files:
                     for j in range(0, len(files), 10):
                         chunk   = files[j:j + 10]
@@ -297,7 +388,6 @@ async def clone_category(source_cat: discord.CategoryChannel, target_cat: discor
                         else:
                             msgs_err += 1
                         await human_sleep(0.8, 2.0)
-
                 elif content.strip():
                     result = await safe_send(new_ch, content=f"**{m.author.name}**: {content}")
                     if result:
@@ -311,11 +401,11 @@ async def clone_category(source_cat: discord.CategoryChannel, target_cat: discor
                     log_info(f"  #{ch.name}: {msg_count} messages processed...")
 
         except discord.Forbidden:
-            log_error(f"No read permission for #{ch.name} — skipping messages")
+            log_error(f"No read permission for #{ch.name}")
         except discord.HTTPException as e:
-            log_error(f"HTTP {e.status} reading history of #{ch.name}: {e.text}")
+            log_error(f"HTTP {e.status} reading #{ch.name}: {e.text}")
         except Exception as e:
-            log_error(f"Unexpected error reading #{ch.name}: {e}")
+            log_error(f"Error reading #{ch.name}: {e}")
             log_error(traceback.format_exc())
 
         log_ok(f"#{ch.name} done — {msg_count} messages | sent: {msgs_ok} | errors: {msgs_err}")
@@ -334,11 +424,46 @@ async def on_ready():
     log_ok(f"Logged in as {bot.user} ({bot.user.id})")
     log_info("Commands:")
     log_info("  !tm <channel_id> [batch]                   Upload media/ to a channel")
-    log_info("  !tc <src_id> <dst_id> [batch]              Transfer files channel->channel")
+    log_info("  !tc <src_id> <dst_id> [batch]              Transfer files channel->channel (auto-resume)")
     log_info("  !kaboom [batch]                            Upload media/ to current channel")
     log_info("  !clone <src_cat_id> <dst_cat_id>           Clone one category")
     log_info("  !clones <dst_cat_id> <src1> <src2> ...     Clone multiple categories into one")
     log_info("  !bump                                      Start auto-bumper")
+    log_info("  !tcreset                                   Clear pending TC resume state")
+
+    # Auto-resume TC if interrupted
+    state = load_tc_state()
+    if state:
+        log_warn(
+            f"Found incomplete TC transfer: "
+            f"src={state['source_id']} dst={state['target_id']} "
+            f"batch={state['batch_size']} already_sent={state['transferred']} "
+            f"last_msg={state['last_message_id']}"
+        )
+        log_info("Auto-resuming in 5 seconds... (send !tcreset to cancel)")
+        await asyncio.sleep(5)
+
+        # Re-check state (user might have sent !tcreset)
+        state = load_tc_state()
+        if not state:
+            log_info("TC resume cancelled.")
+            return
+
+        src = find_channel_by_id(state["source_id"])
+        dst = find_channel_by_id(state["target_id"])
+
+        if not src or not dst:
+            log_error("TC resume failed — channel(s) not found. Clearing state.")
+            clear_tc_state()
+            return
+
+        log_info(f"Resuming TC: #{src.name} -> #{dst.name}")
+        await run_tc(
+            src, dst,
+            state["batch_size"],
+            resume_after_id=state["last_message_id"],
+            already_transferred=state["transferred"],
+        )
 
 @bot.event
 async def on_error(event, *args, **kwargs):
@@ -352,8 +477,15 @@ async def on_message(message):
 
     content = message.content.strip()
 
+    # ── !tcreset ──────────────────────────────────────────────
+    if content == "!tcreset":
+        clear_tc_state()
+        log_ok("TC resume state cleared.")
+        try: await message.delete()
+        except Exception: pass
+
     # ── !tc ───────────────────────────────────────────────────
-    if content.startswith("!tc"):
+    elif content.startswith("!tc"):
         parts = content.split()
         if len(parts) < 3:
             log_warn("Usage: !tc <source_id> <target_id> [batch_size]")
@@ -376,38 +508,9 @@ async def on_message(message):
             log_error(f"Channel(s) not found — src:{source_id} dst:{target_id}")
             return
 
-        log_info(f"Transfer: #{src.name} -> #{dst.name} (batch={batch_size})")
-        file_batch = []
-        total      = 0
-
-        try:
-            async for msg in src.history(limit=None, oldest_first=True):
-                for att in msg.attachments:
-                    if att.size > MAX_FILE_SIZE:
-                        log_warn(f"Skipped oversized {att.filename}")
-                        continue
-                    f = await safe_fetch_file(att)
-                    if f:
-                        file_batch.append(f)
-
-                    if len(file_batch) >= batch_size:
-                        result = await safe_send(dst, files=file_batch)
-                        if result:
-                            total += len(file_batch)
-                            log_info(f"Sent {len(file_batch)} file(s) (total: {total})")
-                        file_batch = []
-                        await human_sleep(1.5, 4.0)
-
-            if file_batch:
-                result = await safe_send(dst, files=file_batch)
-                if result:
-                    total += len(file_batch)
-
-        except Exception as e:
-            log_error(f"Error during transfer: {e}")
-            log_error(traceback.format_exc())
-
-        log_ok(f"Transfer complete — total files sent: {total}")
+        # Save initial state immediately
+        save_tc_state(source_id, target_id, batch_size, None, 0)
+        await run_tc(src, dst, batch_size)
 
     # ── !tm ───────────────────────────────────────────────────
     elif content.startswith("!tm"):
@@ -433,7 +536,7 @@ async def on_message(message):
         log_info(f"Uploading local media to #{target.name} (batch={batch_size})")
         await send_media_in_batches(target, batch_size)
 
-    # ── !clones (multi-clone) ─────────────────────────────────
+    # ── !clones ───────────────────────────────────────────────
     elif content.startswith("!clones"):
         parts = content.split()
         if len(parts) < 3:
@@ -458,23 +561,22 @@ async def on_message(message):
             return
 
         log_info(f"Multi-clone: {len(src_ids)} source(s) -> '{dst_cat.name}'")
-
         for idx, src_id in enumerate(src_ids, 1):
             src_cat = find_category(src_id)
             if not src_cat:
-                log_error(f"[{idx}/{len(src_ids)}] Source category {src_id} not found — skipping")
+                log_error(f"[{idx}/{len(src_ids)}] Source {src_id} not found — skipping")
                 continue
             log_info(f"[{idx}/{len(src_ids)}] Cloning '{src_cat.name}'")
             try:
                 await clone_category(src_cat, dst_cat, guild)
             except Exception as e:
-                log_error(f"[{idx}/{len(src_ids)}] Unhandled error: {e}")
+                log_error(f"[{idx}/{len(src_ids)}] Error: {e}")
                 log_error(traceback.format_exc())
             await human_sleep(2.0, 5.0)
 
         log_ok(f"Multi-clone complete — {len(src_ids)} source(s) processed.")
 
-    # ── !clone (single) ───────────────────────────────────────
+    # ── !clone ────────────────────────────────────────────────
     elif content.startswith("!clone"):
         parts = content.split()
         if len(parts) != 3:
@@ -505,7 +607,7 @@ async def on_message(message):
         try:
             await clone_category(src_cat, dst_cat, guild)
         except Exception as e:
-            log_error(f"Unhandled error during clone: {e}")
+            log_error(f"Error during clone: {e}")
             log_error(traceback.format_exc())
 
     # ── !kaboom ───────────────────────────────────────────────
