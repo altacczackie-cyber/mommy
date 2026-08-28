@@ -263,32 +263,38 @@ async def run_tc(src, dst, batch_size, resume_after_id=None, already_transferred
             kwargs["after"] = discord.Object(id=resume_after_id)
 
         async for msg in src.history(**kwargs):
+            # Collect ALL attachments from this message first
+            msg_files = []
             for att in msg.attachments:
                 if att.size > MAX_FILE_SIZE:
                     log_warn(f"Skipped oversized {att.filename} ({att.size/1024/1024:.1f} MB)")
                     skipped += 1
                     continue
-
                 f = await safe_fetch_file(att)
                 if f:
-                    file_batch.append(f)
+                    msg_files.append(f)
                 else:
                     skipped += 1
 
-                if len(file_batch) >= batch_size:
-                    result = await safe_send(dst, files=file_batch)
-                    if result:
-                        total += len(file_batch)
-                        log_info(f"Sent {len(file_batch)} file(s) (total: {total})")
-                    file_batch = []
-                    # Save checkpoint after every successful batch
-                    last_msg_id = msg.id
-                    save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
-                    await human_sleep(1.5, 4.0)
+            # Add this message's files to the batch
+            file_batch.extend(msg_files)
 
+            # Send when batch is full
+            while len(file_batch) >= batch_size:
+                chunk = file_batch[:batch_size]
+                file_batch = file_batch[batch_size:]
+                result = await safe_send(dst, files=chunk)
+                if result:
+                    total += len(chunk)
+                    log_info(f"Sent {len(chunk)} file(s) (total: {total})")
+                await human_sleep(1.5, 4.0)
+
+            # Checkpoint saved AFTER completing this entire message
+            # So on resume we skip this message entirely — no duplicates
             last_msg_id = msg.id
+            save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
 
-        # Send remaining files
+        # Send any remaining files
         if file_batch:
             result = await safe_send(dst, files=file_batch)
             if result:
