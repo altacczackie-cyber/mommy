@@ -13,7 +13,6 @@ LARGE_MEDIA    = ""
 CONTENT_FOLDER = ""
 LOG_FILE       = ""
 TC_STATE_FILE  = "./tc_state.json"
-TMS_STATE_FILE = "./tms_state.json" 
 
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 MAX_RETRIES   = 5
@@ -46,14 +45,13 @@ async def human_sleep(min_s=1.0, max_s=3.5):
 
 # ── TC CHECKPOINT (resume after restart) ──────────────────────
 
-def save_tc_state(source_id, target_id, batch_size, last_message_id, transferred, fail_count=0):
+def save_tc_state(source_id, target_id, batch_size, last_message_id, transferred):
     state = {
-        "source_id":       source_id,
-        "target_id":       target_id,
-        "batch_size":      batch_size,
+        "source_id":      source_id,
+        "target_id":      target_id,
+        "batch_size":     batch_size,
         "last_message_id": last_message_id,
-        "transferred":     transferred,
-        "fail_count":      fail_count,
+        "transferred":    transferred,
     }
     with open(TC_STATE_FILE, "w") as f:
         json.dump(state, f)
@@ -70,32 +68,6 @@ def load_tc_state():
 def clear_tc_state():
     if os.path.exists(TC_STATE_FILE):
         os.remove(TC_STATE_FILE)
-
-# ── TMS CHECKPOINT ────────────────────────────────────────────
-
-def save_tms_state(target_guild_id, src_ids, channel_index, last_message_id, transferred):
-    state = {
-        "target_guild_id":  target_guild_id,
-        "src_ids":          src_ids,
-        "channel_index":    channel_index,
-        "last_message_id":  last_message_id,
-        "transferred":      transferred,
-    }
-    with open(TMS_STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-def load_tms_state():
-    if os.path.exists(TMS_STATE_FILE):
-        try:
-            with open(TMS_STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return None
-
-def clear_tms_state():
-    if os.path.exists(TMS_STATE_FILE):
-        os.remove(TMS_STATE_FILE)
 
 # ── RETRY HELPERS ─────────────────────────────────────────────
 
@@ -291,38 +263,32 @@ async def run_tc(src, dst, batch_size, resume_after_id=None, already_transferred
             kwargs["after"] = discord.Object(id=resume_after_id)
 
         async for msg in src.history(**kwargs):
-            # Collect ALL attachments from this message first
-            msg_files = []
             for att in msg.attachments:
                 if att.size > MAX_FILE_SIZE:
                     log_warn(f"Skipped oversized {att.filename} ({att.size/1024/1024:.1f} MB)")
                     skipped += 1
                     continue
+
                 f = await safe_fetch_file(att)
                 if f:
-                    msg_files.append(f)
+                    file_batch.append(f)
                 else:
                     skipped += 1
 
-            # Add this message's files to the batch
-            file_batch.extend(msg_files)
+                if len(file_batch) >= batch_size:
+                    result = await safe_send(dst, files=file_batch)
+                    if result:
+                        total += len(file_batch)
+                        log_info(f"Sent {len(file_batch)} file(s) (total: {total})")
+                    file_batch = []
+                    # Save checkpoint after every successful batch
+                    last_msg_id = msg.id
+                    save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
+                    await human_sleep(1.5, 4.0)
 
-            # Send when batch is full
-            while len(file_batch) >= batch_size:
-                chunk = file_batch[:batch_size]
-                file_batch = file_batch[batch_size:]
-                result = await safe_send(dst, files=chunk)
-                if result:
-                    total += len(chunk)
-                    log_info(f"Sent {len(chunk)} file(s) (total: {total})")
-                await human_sleep(1.5, 4.0)
-
-            # Checkpoint saved AFTER completing this entire message
-            # So on resume we skip this message entirely — no duplicates
             last_msg_id = msg.id
-            save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
 
-        # Send any remaining files
+        # Send remaining files
         if file_batch:
             result = await safe_send(dst, files=file_batch)
             if result:
@@ -330,21 +296,11 @@ async def run_tc(src, dst, batch_size, resume_after_id=None, already_transferred
             file_batch = []
 
     except discord.Forbidden:
-        log_error(f"No permission to read source channel — clearing state to avoid infinite restart loop")
-        clear_tc_state()
-        return
+        log_error(f"No permission to read #{src.name}")
     except discord.HTTPException as e:
         log_error(f"HTTP {e.status} reading history: {e.text}")
         save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
         log_warn("State saved — will resume from here on next restart.")
-        return
-    except asyncio.CancelledError:
-        log_warn("Transfer cancelled by asyncio — saving checkpoint.")
-        save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
-        raise
-    except GeneratorExit:
-        log_warn("Transfer generator exit — saving checkpoint.")
-        save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
         return
     except Exception as e:
         log_error(f"Unexpected error during transfer: {e}")
@@ -356,144 +312,6 @@ async def run_tc(src, dst, batch_size, resume_after_id=None, already_transferred
     # Done — clear checkpoint
     clear_tc_state()
     log_ok(f"Transfer complete — total: {total} | skipped: {skipped}")
-
-# ── TMS: MULTI SOURCE TRANSFER ───────────────────────────────
-
-async def run_tms(target_guild, src_ids, start_channel_index=0, resume_after_msg_id=None, already_transferred=0):
-    """
-    For each source channel ID (sorted by ID ascending):
-      1. Create a channel with the same name in target_guild
-      2. Transfer all media from source -> new channel
-    Checkpoints after every message so restarts resume exactly.
-    """
-    # Sort source IDs ascending so order is deterministic
-    src_ids_sorted = sorted(src_ids)
-    total_channels = len(src_ids_sorted)
-    total_transferred = already_transferred
-
-    log_info(f"TMS: {total_channels} source channel(s) -> guild '{target_guild.name}'")
-
-    for ch_idx in range(start_channel_index, total_channels):
-        src_id = src_ids_sorted[ch_idx]
-        src = find_channel_by_id(src_id)
-
-        if not src:
-            log_error(f"[{ch_idx+1}/{total_channels}] Source channel {src_id} not found — skipping")
-            save_tms_state(target_guild.id, src_ids, ch_idx + 1, None, total_transferred)
-            continue
-
-        log_info(f"[{ch_idx+1}/{total_channels}] Processing #{src.name} ({src_id})")
-
-        # Find or create channel in target guild
-        dst = discord.utils.get(target_guild.text_channels, name=src.name)
-        if dst:
-            log_warn(f"Channel #{src.name} already exists in target guild — using it")
-        else:
-            created = False
-            for attempt in range(MAX_RETRIES):
-                try:
-                    dst = await target_guild.create_text_channel(src.name, nsfw=True)
-                    log_ok(f"Created #{dst.name} in '{target_guild.name}'")
-                    created = True
-                    break
-                except discord.HTTPException as e:
-                    if e.status == 429:
-                        wait = 5 + random.uniform(1, 3)
-                        log_warn(f"Rate limited creating channel. Waiting {wait:.1f}s...")
-                        await asyncio.sleep(wait)
-                    elif e.status == 403:
-                        log_error(f"No permission to create channels in '{target_guild.name}' — aborting TMS")
-                        clear_tms_state()
-                        return
-                    else:
-                        log_error(f"HTTP {e.status} creating #{src.name}: {e.text}")
-                        await asyncio.sleep(2 ** attempt)
-                except Exception as e:
-                    log_error(f"Error creating #{src.name}: {e}")
-                    log_error(traceback.format_exc())
-                    break
-
-            if not dst:
-                log_error(f"Could not create #{src.name} — skipping")
-                save_tms_state(target_guild.id, src_ids, ch_idx + 1, None, total_transferred)
-                continue
-
-        # Transfer media from src -> dst
-        log_info(f"Transferring media from #{src.name} -> #{dst.name}" +
-                 (f" (resuming after msg {resume_after_msg_id})" if ch_idx == start_channel_index and resume_after_msg_id else ""))
-
-        file_batch   = []
-        last_msg_id  = resume_after_msg_id if ch_idx == start_channel_index else None
-        ch_transferred = 0
-        ch_skipped   = 0
-
-        try:
-            kwargs = {"limit": None, "oldest_first": True}
-            if last_msg_id:
-                kwargs["after"] = discord.Object(id=last_msg_id)
-
-            async for msg in src.history(**kwargs):
-                # Collect all attachments from this message
-                msg_files = []
-                for att in msg.attachments:
-                    if att.size > MAX_FILE_SIZE:
-                        log_warn(f"Skipped oversized {att.filename}")
-                        ch_skipped += 1
-                        continue
-                    f = await safe_fetch_file(att)
-                    if f:
-                        msg_files.append(f)
-                    else:
-                        ch_skipped += 1
-
-                file_batch.extend(msg_files)
-
-                # Send full batches of 5
-                while len(file_batch) >= 5:
-                    chunk = file_batch[:5]
-                    file_batch = file_batch[5:]
-                    result = await safe_send(dst, files=chunk)
-                    if result:
-                        ch_transferred += len(chunk)
-                        total_transferred += len(chunk)
-                        log_info(f"  [{ch_idx+1}/{total_channels}] #{src.name}: sent {len(chunk)} file(s) (ch total: {ch_transferred})")
-                    await human_sleep(1.5, 4.0)
-
-                # Checkpoint after each complete message
-                last_msg_id = msg.id
-                save_tms_state(target_guild.id, src_ids, ch_idx, last_msg_id, total_transferred)
-
-            # Send remaining
-            if file_batch:
-                result = await safe_send(dst, files=file_batch)
-                if result:
-                    ch_transferred += len(file_batch)
-                    total_transferred += len(file_batch)
-                file_batch = []
-
-        except discord.Forbidden:
-            log_error(f"No read permission for #{src.name} — skipping")
-        except discord.HTTPException as e:
-            log_error(f"HTTP {e.status} reading #{src.name}: {e.text}")
-            save_tms_state(target_guild.id, src_ids, ch_idx, last_msg_id, total_transferred)
-            log_warn("Checkpoint saved — will resume here on restart.")
-            return
-        except Exception as e:
-            log_error(f"Unexpected error on #{src.name}: {e}")
-            log_error(traceback.format_exc())
-            save_tms_state(target_guild.id, src_ids, ch_idx, last_msg_id, total_transferred)
-            log_warn("Checkpoint saved — will resume here on restart.")
-            return
-
-        log_ok(f"[{ch_idx+1}/{total_channels}] #{src.name} done — transferred: {ch_transferred} | skipped: {ch_skipped}")
-
-        # Move to next channel — reset message resume
-        resume_after_msg_id = None
-        save_tms_state(target_guild.id, src_ids, ch_idx + 1, None, total_transferred)
-        await human_sleep(2.0, 5.0)
-
-    clear_tms_state()
-    log_ok(f"TMS complete — total files transferred: {total_transferred}")
 
 # ── CLONE ─────────────────────────────────────────────────────
 
@@ -606,8 +424,6 @@ async def on_ready():
     log_ok(f"Logged in as {bot.user} ({bot.user.id})")
     log_info("Commands:")
     log_info("  !tm <channel_id> [batch]                   Upload media/ to a channel")
-    log_info("  !tms <target_guild_id> <src1> <src2> ...   Multi-source transfer with channel creation (auto-resume)")
-    log_info("  !tmsreset                                  Clear pending TMS resume state")
     log_info("  !tc <src_id> <dst_id> [batch]              Transfer files channel->channel (auto-resume)")
     log_info("  !kaboom [batch]                            Upload media/ to current channel")
     log_info("  !clone <src_cat_id> <dst_cat_id>           Clone one category")
@@ -615,71 +431,39 @@ async def on_ready():
     log_info("  !bump                                      Start auto-bumper")
     log_info("  !tcreset                                   Clear pending TC resume state")
 
-    # Auto-resume TMS if interrupted
-    tms_state = load_tms_state()
-    if tms_state:
-        log_warn(
-            f"Found incomplete TMS: "
-            f"guild={tms_state['target_guild_id']} "
-            f"channels={len(tms_state['src_ids'])} "
-            f"at_channel_index={tms_state['channel_index']} "
-            f"transferred={tms_state['transferred']}"
-        )
-        log_info("Auto-resuming TMS in 5s... (send !tmsreset to cancel)")
-        await asyncio.sleep(5)
-        tms_state = load_tms_state()
-        if tms_state:
-            target_guild = bot.get_guild(tms_state["target_guild_id"])
-            if not target_guild:
-                log_error("TMS resume: target guild not found. Clearing state.")
-                clear_tms_state()
-            else:
-                await run_tms(
-                    target_guild,
-                    tms_state["src_ids"],
-                    start_channel_index=tms_state["channel_index"],
-                    resume_after_msg_id=tms_state["last_message_id"],
-                    already_transferred=tms_state["transferred"],
-                )
-
     # Auto-resume TC if interrupted
     state = load_tc_state()
     if state:
-        fail_count = state.get("fail_count", 0)
-        if fail_count >= 3:
-            log_error(f"TC resume failed {fail_count} times in a row — clearing state to stop loop. Use !tc to restart manually.")
+        log_warn(
+            f"Found incomplete TC transfer: "
+            f"src={state['source_id']} dst={state['target_id']} "
+            f"batch={state['batch_size']} already_sent={state['transferred']} "
+            f"last_msg={state['last_message_id']}"
+        )
+        log_info("Auto-resuming in 5 seconds... (send !tcreset to cancel)")
+        await asyncio.sleep(5)
+
+        # Re-check state (user might have sent !tcreset)
+        state = load_tc_state()
+        if not state:
+            log_info("TC resume cancelled.")
+            return
+
+        src = find_channel_by_id(state["source_id"])
+        dst = find_channel_by_id(state["target_id"])
+
+        if not src or not dst:
+            log_error("TC resume failed — channel(s) not found. Clearing state.")
             clear_tc_state()
-        else:
-            log_warn(
-                f"Found incomplete TC transfer: "
-                f"src={state['source_id']} dst={state['target_id']} "
-                f"batch={state['batch_size']} already_sent={state['transferred']} "
-                f"last_msg={state['last_message_id']} fail_count={fail_count}"
-            )
-            log_info("Auto-resuming in 5 seconds... (send !tcreset to cancel)")
-            await asyncio.sleep(5)
+            return
 
-            state = load_tc_state()
-            if not state:
-                log_info("TC resume cancelled.")
-            else:
-                src = find_channel_by_id(state["source_id"])
-                dst = find_channel_by_id(state["target_id"])
-
-                if not src or not dst:
-                    log_error("TC resume failed — channel(s) not found. Clearing state.")
-                    clear_tc_state()
-                else:
-                    # Increment fail count before attempting — reset to 0 on success
-                    save_tc_state(state["source_id"], state["target_id"], state["batch_size"],
-                                  state["last_message_id"], state["transferred"], fail_count + 1)
-                    log_info(f"Resuming TC: #{src.name} -> #{dst.name}")
-                    await run_tc(
-                        src, dst,
-                        state["batch_size"],
-                        resume_after_id=state["last_message_id"],
-                        already_transferred=state["transferred"],
-                    )
+        log_info(f"Resuming TC: #{src.name} -> #{dst.name}")
+        await run_tc(
+            src, dst,
+            state["batch_size"],
+            resume_after_id=state["last_message_id"],
+            already_transferred=state["transferred"],
+        )
 
 @bot.event
 async def on_error(event, *args, **kwargs):
@@ -692,44 +476,6 @@ async def on_message(message):
         return
 
     content = message.content.strip()
-
-    # ── !tmsreset ─────────────────────────────────────────────
-    if content == "!tmsreset":
-        clear_tms_state()
-        log_ok("TMS resume state cleared.")
-        try: await message.delete()
-        except Exception: pass
-
-    # ── !tms <target_guild_id> <src_id1> <src_id2> ... ───────
-    elif content.startswith("!tms"):
-        parts = content.split()
-        if len(parts) < 3:
-            log_warn("Usage: !tms <target_guild_id> <src_ch_id1> <src_ch_id2> ...")
-            return
-
-        try: await message.delete()
-        except Exception: pass
-
-        try:
-            target_guild_id = int(parts[1])
-            src_ids         = [int(x) for x in parts[2:]]
-        except ValueError:
-            log_warn("All IDs must be numbers.")
-            return
-
-        target_guild = bot.get_guild(target_guild_id)
-        if not target_guild:
-            log_error(f"Target guild {target_guild_id} not found — is the bot in that server?")
-            return
-
-        log_info(f"TMS: {len(src_ids)} source channel(s) -> '{target_guild.name}'")
-        save_tms_state(target_guild_id, src_ids, 0, None, 0)
-
-        try:
-            await run_tms(target_guild, src_ids)
-        except Exception as e:
-            log_error(f"TMS unhandled error: {e}")
-            log_error(traceback.format_exc())
 
     # ── !tcreset ──────────────────────────────────────────────
     if content == "!tcreset":
