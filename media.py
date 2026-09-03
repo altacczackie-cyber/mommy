@@ -592,75 +592,81 @@ def clear_snipe_state():
     if os.path.exists(SNIPE_STATE_FILE):
         os.remove(SNIPE_STATE_FILE)
 
-async def check_vanity_free(vanity: str, session: aiohttp.ClientSession) -> bool:
-    """Returns True if the vanity is not currently claimed by anyone."""
+async def check_vanity_free(vanity: str) -> bool:
+    """Check vanity using bot.http — correct headers, TLS fingerprint, no Cloudflare block."""
     try:
-        url = f"https://discord.com/api/v10/invites/{vanity}"
-        headers = {"Authorization": config.TOKEN}
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 404:
-                return True   # vanity is free
-            if resp.status == 200:
-                data = await resp.json()
-                # If it resolves to a guild it's taken
-                return "guild" not in data
-            return False
-    except Exception:
+        from discord.http import Route
+        data = await bot.http.request(Route("GET", f"/invites/{vanity}"))
+        # If we get data back it's taken (has guild info)
+        return "guild" not in data
+    except discord.NotFound:
+        return True   # 404 = vanity is free
+    except discord.HTTPException as e:
+        if e.status == 429:
+            retry = getattr(e, "retry_after", 1.0)
+            log_warn(f"Rate limited checking vanity — waiting {retry:.1f}s")
+            await asyncio.sleep(retry)
+        return False
+    except Exception as e:
+        log_warn(f"Check vanity error: {e}")
         return False
 
-async def claim_vanity(vanity: str, guild_id: int, session: aiohttp.ClientSession) -> bool:
-    """Attempt to set the vanity on our guild. Returns True on success."""
+async def claim_vanity(vanity: str, guild_id: int) -> bool:
+    """Claim vanity using bot.http — same session, correct headers."""
     try:
-        url = f"https://discord.com/api/v10/guilds/{guild_id}/vanity-url"
-        headers = {
-            "Authorization": config.TOKEN,
-            "Content-Type": "application/json",
-        }
-        payload = json.dumps({"code": vanity})
-        async with session.patch(url, data=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                return True
-            body = await resp.text()
-            log_warn(f"Claim attempt: HTTP {resp.status} — {body[:120]}")
-            return False
+        from discord.http import Route
+        await bot.http.request(
+            Route("PATCH", f"/guilds/{guild_id}/vanity-url"),
+            json={"code": vanity},
+        )
+        return True
+    except discord.HTTPException as e:
+        if e.status == 429:
+            retry = getattr(e, "retry_after", 0.5)
+            log_warn(f"Rate limited claiming — waiting {retry:.1f}s")
+            await asyncio.sleep(retry)
+        elif e.status in (403, 400):
+            log_error(f"Claim failed permanently: HTTP {e.status} — {e.text}")
+        else:
+            log_warn(f"Claim HTTP {e.status}: {e.text[:80]}")
+        return False
     except Exception as e:
-        log_warn(f"Claim request error: {e}")
+        log_warn(f"Claim error: {e}")
         return False
 
 async def sniper_loop(vanity: str, guild_id: int):
     log_ok(f"Sniper started — watching /{vanity} for guild {guild_id}")
-    poll_interval = 0.5   # check every 500ms
-    claim_interval = 0.1  # spam claims every 100ms when free
-    max_claim_attempts = 30  # try up to 30x before going back to polling
+    poll_interval     = 0.5    # check every 500ms
+    claim_interval    = 0.1    # spam claims every 100ms when free
+    max_claim_attempts = 40    # try 40x before going back to polling
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                is_free = await check_vanity_free(vanity, session)
+    while True:
+        try:
+            is_free = await check_vanity_free(vanity)
 
-                if is_free:
-                    log_warn(f"/{vanity} appears FREE — spamming claims...")
-                    success = False
-                    for attempt in range(max_claim_attempts):
-                        result = await claim_vanity(vanity, guild_id, session)
-                        if result:
-                            log_ok(f"SNIPED /{vanity} on attempt {attempt+1}!")
-                            success = True
-                            clear_snipe_state()
-                            return
-                        await asyncio.sleep(claim_interval)
+            if is_free:
+                log_warn(f"/{vanity} appears FREE — spamming claims...")
+                success = False
+                for attempt in range(max_claim_attempts):
+                    result = await claim_vanity(vanity, guild_id)
+                    if result:
+                        log_ok(f"SNIPED /{vanity} on attempt {attempt+1}!")
+                        success = True
+                        clear_snipe_state()
+                        return
+                    await asyncio.sleep(claim_interval)
 
-                    if not success:
-                        log_warn(f"/{vanity} — {max_claim_attempts} claim attempts failed (probably cooldown). Resuming polling...")
+                if not success:
+                    log_warn(f"/{vanity} — {max_claim_attempts} claims failed (cooldown). Resuming polling...")
 
-                await asyncio.sleep(poll_interval)
+            await asyncio.sleep(poll_interval)
 
-            except asyncio.CancelledError:
-                log_warn("Sniper task cancelled.")
-                return
-            except Exception as e:
-                log_error(f"Sniper error: {e}")
-                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            log_warn("Sniper task cancelled.")
+            return
+        except Exception as e:
+            log_error(f"Sniper error: {e}")
+            await asyncio.sleep(2)
 
 # ── EVENTS ────────────────────────────────────────────────────
 
