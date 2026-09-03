@@ -7,6 +7,7 @@ import traceback
 import json
 import tempfile
 import aiohttp
+import pyotp
 import discord
 from discord.ext import commands
 import config
@@ -677,6 +678,17 @@ async def solve_captcha(sitekey: str, rqdata: str = None) -> str | None:
         log_error(f"[CAPTCHA] Solver error: {e}")
         return None
 
+def get_totp_code() -> str | None:
+    """Generate current TOTP code from TOTP_SECRET env var."""
+    secret = os.environ.get("TOTP_SECRET", "").strip().upper().replace(" ", "")
+    if not secret:
+        return None
+    try:
+        return pyotp.TOTP(secret).now()
+    except Exception as e:
+        log_error(f"[TOTP] Failed to generate code: {e}")
+        return None
+
 async def claim_vanity(vanity: str, guild_id: int, captcha_token: str = None) -> bool:
     """Attempt to claim vanity. Raises CloudflareBanError on long rate limits."""
     try:
@@ -684,6 +696,12 @@ async def claim_vanity(vanity: str, guild_id: int, captcha_token: str = None) ->
         payload = {"code": vanity}
         if captcha_token:
             payload["captcha_key"] = captcha_token
+
+        # Auto-attach TOTP code if available
+        totp = get_totp_code()
+        if totp:
+            payload["mfa_totp_code"] = totp
+            payload["mfa_totp_ticket"] = ""  # Discord may need this field
 
         await bot.http.request(
             Route("PATCH", f"/guilds/{guild_id}/vanity-url"),
@@ -705,8 +723,23 @@ async def claim_vanity(vanity: str, guild_id: int, captcha_token: str = None) ->
             log_warn(f"[SNIPER] Rate limited — waiting {retry:.1f}s")
             await asyncio.sleep(retry)
         elif e.status == 401:
-            log_error("[SNIPER] HTTP 401 — token invalid/expired. Get fresh token from Discord browser.")
-            raise RuntimeError("invalid_token")
+            # Distinguish between invalid token and 2FA requirement
+            err_text = (e.text or "").lower()
+            if "two_factor" in err_text or "two factor" in err_text or "mfa" in err_text:
+                totp = get_totp_code()
+                if totp and not captcha_token:
+                    log_warn(f"[SNIPER] 2FA required — retrying with TOTP code {totp}...")
+                    return await claim_vanity(vanity, guild_id, captcha_token=captcha_token)
+                elif not totp:
+                    log_error("[SNIPER] 2FA required but TOTP_SECRET not set in Railway env vars.")
+                    raise RuntimeError("2fa_required")
+                else:
+                    log_error("[SNIPER] 2FA required and TOTP failed — check TOTP_SECRET.")
+                    raise RuntimeError("2fa_required")
+            else:
+                log_error(f"[SNIPER] HTTP 401 — unauthorized: {e.text[:100]}")
+                log_error("[SNIPER] If token is valid but this fails, get a fresh token from Discord browser.")
+                raise RuntimeError("invalid_token")
         elif e.status == 403:
             log_error(f"[SNIPER] HTTP 403 — no permission on guild {guild_id}. Are you the owner?")
             raise RuntimeError("no_permission")
@@ -747,14 +780,19 @@ async def sniper_loop_safe(vanity: str, guild_id: int):
             log_warn("[SNIPER] Task cancelled.")
             return
         except RuntimeError as e:
-            if str(e) == "captcha_unsolvable":
+            err = str(e)
+            if err == "captcha_unsolvable":
                 log_error("[SNIPER] Captcha required but cannot solve — add CAPSOLVER_KEY to Railway env vars.")
-                log_error("[SNIPER] Sniper paused for 60s then retrying (captcha may go away)...")
+                log_error("[SNIPER] Pausing 60s then retrying...")
                 await asyncio.sleep(60)
-                # don't clear state — keep trying
+            elif err == "2fa_required":
+                log_error("[SNIPER] 2FA required by server — cannot claim until fixed.")
+                log_error("[SNIPER] Fix: disable '2FA for moderator actions' in server settings, OR re-enable TOTP 2FA on your account.")
+                log_error("[SNIPER] Pausing 5 min then retrying in case settings change...")
+                await asyncio.sleep(300)
             else:
                 # Fatal errors (bad token, no permission) — stop entirely
-                log_error(f"[SNIPER] Fatal error ({e}) — stopping. Fix the issue and restart with !snipe.")
+                log_error(f"[SNIPER] Fatal error ({err}) — stopping. Fix the issue and restart with !snipe.")
                 clear_snipe_state()
                 return
         except Exception as e:
