@@ -23,6 +23,11 @@ MAX_RETRIES   = 5
 
 bot = commands.Bot(command_prefix='!', self_bot=True)
 
+# Track whether on_ready has already run (avoid duplicate tasks on reconnect)
+_ready_done      = False
+snipe_task       = None
+_watchdog_task   = None
+
 # ── LOGGING ───────────────────────────────────────────────────
 
 def ts():
@@ -573,8 +578,6 @@ async def clone_category(source_cat, target_cat, guild):
 
 # ── VANITY SNIPER ─────────────────────────────────────────────
 
-snipe_task = None  # running asyncio task
-
 def save_snipe_state(vanity, guild_id):
     with open(SNIPE_STATE_FILE, "w") as f:
         json.dump({"vanity": vanity, "guild_id": guild_id}, f)
@@ -593,86 +596,271 @@ def clear_snipe_state():
         os.remove(SNIPE_STATE_FILE)
 
 async def check_vanity_free(vanity: str) -> bool:
-    """Check vanity using bot.http — correct headers, TLS fingerprint, no Cloudflare block."""
+    """Returns True if vanity is available. Uses bot.http for correct headers."""
     try:
         from discord.http import Route
         data = await bot.http.request(Route("GET", f"/invites/{vanity}"))
-        # If we get data back it's taken (has guild info)
-        return "guild" not in data
+        taken = "guild" in data
+        return not taken
     except discord.NotFound:
-        return True   # 404 = vanity is free
+        return True   # 404 = definitely free
     except discord.HTTPException as e:
         if e.status == 429:
             retry = getattr(e, "retry_after", 1.0)
-            log_warn(f"Rate limited checking vanity — waiting {retry:.1f}s")
+            log_warn(f"[SNIPER] Rate limited on check — waiting {retry:.1f}s")
             await asyncio.sleep(retry)
         return False
     except Exception as e:
-        log_warn(f"Check vanity error: {e}")
+        log_warn(f"[SNIPER] Check error: {type(e).__name__}: {e}")
         return False
 
-async def claim_vanity(vanity: str, guild_id: int) -> bool:
-    """Claim vanity using bot.http — same session, correct headers."""
+class CloudflareBanError(Exception):
+    def __init__(self, retry_after): self.retry_after = retry_after
+
+# ── CAPTCHA SOLVER (optional) ────────────────────────────────
+# Set CAPSOLVER_KEY env var to enable automatic captcha solving
+# Get a key at capsolver.com (~$3/1000 solves)
+
+async def solve_captcha(sitekey: str, rqdata: str = None) -> str | None:
+    """Solve Discord hCaptcha via CapSolver. Returns token or None."""
+    api_key = os.environ.get("CAPSOLVER_KEY", "").strip()
+    if not api_key:
+        log_error("[CAPTCHA] CAPTCHA required but CAPSOLVER_KEY not set — cannot solve automatically.")
+        log_error("[CAPTCHA] Get a key at capsolver.com and add CAPSOLVER_KEY to Railway env vars.")
+        return None
+
+    try:
+        log_warn("[CAPTCHA] Solving captcha via CapSolver...")
+        payload = {
+            "clientKey": api_key,
+            "task": {
+                "type":       "HCaptchaTaskProxyLess",
+                "websiteURL": "https://discord.com",
+                "websiteKey": sitekey,
+            }
+        }
+        if rqdata:
+            payload["task"]["enterprisePayload"] = {"rqdata": rqdata}
+
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Create task
+            async with session.post("https://api.capsolver.com/createTask", json=payload) as r:
+                data = await r.json()
+                task_id = data.get("taskId")
+                if not task_id:
+                    log_error(f"[CAPTCHA] CapSolver task creation failed: {data.get('errorDescription', data)}")
+                    return None
+
+            # Poll for result
+            for _ in range(60):
+                await asyncio.sleep(3)
+                async with session.post("https://api.capsolver.com/getTaskResult",
+                                        json={"clientKey": api_key, "taskId": task_id}) as r:
+                    result = await r.json()
+                    status = result.get("status")
+                    if status == "ready":
+                        token = result.get("solution", {}).get("gRecaptchaResponse")
+                        if token:
+                            log_ok("[CAPTCHA] Captcha solved successfully.")
+                            return token
+                        log_error("[CAPTCHA] No token in solution.")
+                        return None
+                    elif status == "failed":
+                        log_error(f"[CAPTCHA] CapSolver failed: {result.get('errorDescription')}")
+                        return None
+
+            log_error("[CAPTCHA] Captcha solve timed out after 180s.")
+            return None
+
+    except Exception as e:
+        log_error(f"[CAPTCHA] Solver error: {e}")
+        return None
+
+async def claim_vanity(vanity: str, guild_id: int, captcha_token: str = None) -> bool:
+    """Attempt to claim vanity. Raises CloudflareBanError on long rate limits."""
     try:
         from discord.http import Route
+        payload = {"code": vanity}
+        if captcha_token:
+            payload["captcha_key"] = captcha_token
+
         await bot.http.request(
             Route("PATCH", f"/guilds/{guild_id}/vanity-url"),
-            json={"code": vanity},
+            json=payload,
         )
         return True
     except discord.HTTPException as e:
-        if e.status == 429:
-            retry = getattr(e, "retry_after", 0.5)
-            log_warn(f"Rate limited claiming — waiting {retry:.1f}s")
-            await asyncio.sleep(retry)
-        elif e.status in (403, 400):
-            log_error(f"Claim failed permanently: HTTP {e.status} — {e.text}")
+        # Strip HTML from error text for clean logs
+        text = e.text or ""
+        if text.strip().startswith("<"):
+            text = "(HTML response — Cloudflare)"
         else:
-            log_warn(f"Claim HTTP {e.status}: {e.text[:80]}")
+            text = text[:200]
+
+        if e.status == 429:
+            retry = getattr(e, "retry_after", 1.0)
+            if retry > 60:
+                raise CloudflareBanError(retry)
+            log_warn(f"[SNIPER] Rate limited — waiting {retry:.1f}s")
+            await asyncio.sleep(retry)
+        elif e.status == 401:
+            log_error("[SNIPER] HTTP 401 — token invalid/expired. Get fresh token from Discord browser.")
+            raise RuntimeError("invalid_token")
+        elif e.status == 403:
+            log_error(f"[SNIPER] HTTP 403 — no permission on guild {guild_id}. Are you the owner?")
+            raise RuntimeError("no_permission")
+        elif e.status == 400:
+            # Check if it's a captcha challenge
+            try:
+                err_data = json.loads(text)
+            except Exception:
+                err_data = {}
+
+            if "captcha_key" in err_data or "captcha_sitekey" in err_data:
+                sitekey = err_data.get("captcha_sitekey", "a9b5fb07-92ff-493f-86fe-352a2803b3df")
+                rqdata  = err_data.get("captcha_rqdata") or err_data.get("captcha_rqtoken")
+                log_warn(f"[CAPTCHA] Discord requires captcha (sitekey: {sitekey[:16]}...)")
+                token = await solve_captcha(sitekey, rqdata)
+                if token:
+                    return await claim_vanity(vanity, guild_id, captcha_token=token)
+                # No solver available
+                raise RuntimeError("captcha_unsolvable")
+            else:
+                log_warn(f"[SNIPER] HTTP 400: {text[:100]}")
+        else:
+            log_warn(f"[SNIPER] HTTP {e.status}: {text[:100]}")
         return False
+    except (CloudflareBanError, RuntimeError):
+        raise
     except Exception as e:
-        log_warn(f"Claim error: {e}")
+        log_warn(f"[SNIPER] Claim error: {type(e).__name__}: {e}")
         return False
 
+async def sniper_loop_safe(vanity: str, guild_id: int):
+    """Restarts sniper_loop on unexpected crashes indefinitely."""
+    while True:
+        try:
+            await sniper_loop(vanity, guild_id)
+            return  # clean exit (sniped or cancelled)
+        except asyncio.CancelledError:
+            log_warn("[SNIPER] Task cancelled.")
+            return
+        except RuntimeError as e:
+            if str(e) == "captcha_unsolvable":
+                log_error("[SNIPER] Captcha required but cannot solve — add CAPSOLVER_KEY to Railway env vars.")
+                log_error("[SNIPER] Sniper paused for 60s then retrying (captcha may go away)...")
+                await asyncio.sleep(60)
+                # don't clear state — keep trying
+            else:
+                # Fatal errors (bad token, no permission) — stop entirely
+                log_error(f"[SNIPER] Fatal error ({e}) — stopping. Fix the issue and restart with !snipe.")
+                clear_snipe_state()
+                return
+        except Exception as e:
+            log_error(f"[SNIPER] Unexpected crash: {e}")
+            log_error(traceback.format_exc())
+            log_warn("[SNIPER] Restarting in 15s...")
+            await asyncio.sleep(15)
+
 async def sniper_loop(vanity: str, guild_id: int):
-    log_ok(f"Sniper started — watching /{vanity} for guild {guild_id}")
-    poll_interval     = 0.5    # check every 500ms
-    claim_interval    = 0.1    # spam claims every 100ms when free
-    max_claim_attempts = 40    # try 40x before going back to polling
+    poll_interval      = 0.5   # poll every 500ms
+    claim_interval     = 0.3   # 300ms between claims — stays under Cloudflare limit
+    max_claim_attempts = 10    # 10 tries = 3s window per trigger
+    poll_count         = 0
+    log_every          = 120   # log "still watching" every 60 seconds (120 polls × 0.5s)
+
+    log_ok(f"[SNIPER] Watching discord.gg/{vanity} | target guild: {guild_id}")
+    log_info(f"[SNIPER] Poll: every {poll_interval}s | Claim: {max_claim_attempts}x every {claim_interval}s")
 
     while True:
         try:
             is_free = await check_vanity_free(vanity)
+            poll_count += 1
+
+            if poll_count % log_every == 0:
+                log_info(f"[SNIPER] Still watching discord.gg/{vanity} — polls: {poll_count} ({poll_count * poll_interval / 60:.1f} min)")
 
             if is_free:
-                log_warn(f"/{vanity} appears FREE — spamming claims...")
+                log_warn(f"[SNIPER] discord.gg/{vanity} appears FREE — attempting to claim...")
                 success = False
+
                 for attempt in range(max_claim_attempts):
-                    result = await claim_vanity(vanity, guild_id)
+                    try:
+                        result = await claim_vanity(vanity, guild_id)
+                    except CloudflareBanError as ban:
+                        log_error(f"[SNIPER] Cloudflare ban — pausing {ban.retry_after:.0f}s ({ban.retry_after/60:.1f} min)")
+                        await asyncio.sleep(ban.retry_after)
+                        break
+                    except RuntimeError:
+                        raise  # propagate fatal errors up
+
                     if result:
-                        log_ok(f"SNIPED /{vanity} on attempt {attempt+1}!")
-                        success = True
+                        log_ok(f"[SNIPER] *** SNIPED discord.gg/{vanity} on attempt {attempt+1} ***")
                         clear_snipe_state()
                         return
                     await asyncio.sleep(claim_interval)
 
                 if not success:
-                    log_warn(f"/{vanity} — {max_claim_attempts} claims failed (cooldown). Resuming polling...")
+                    log_warn(f"[SNIPER] {max_claim_attempts} claim attempts failed — vanity likely on cooldown. Resuming poll...")
 
             await asyncio.sleep(poll_interval)
 
         except asyncio.CancelledError:
-            log_warn("Sniper task cancelled.")
+            log_warn("[SNIPER] Task cancelled.")
             return
+        except RuntimeError:
+            raise
         except Exception as e:
-            log_error(f"Sniper error: {e}")
-            await asyncio.sleep(2)
+            log_error(f"[SNIPER] Loop error: {type(e).__name__}: {e}")
+            await asyncio.sleep(5)
 
 # ── EVENTS ────────────────────────────────────────────────────
 
 @bot.event
 async def on_ready():
+    global _ready_done, snipe_task, _watchdog_task
+
+    # on_ready fires on every reconnect — only do init once
+    if _ready_done:
+        log_info("Reconnected to gateway.")
+        return
+    _ready_done = True
+
     log_ok(f"Logged in as {bot.user} ({bot.user.id})")
+
+    # Clean up any leftover temp files from previous session
+    try:
+        import glob
+        stale = glob.glob(os.path.join(tempfile.gettempdir(), "tmp*"))
+        removed = 0
+        for f in stale:
+            try:
+                if os.path.isfile(f) and (datetime.datetime.now().timestamp() - os.path.getmtime(f)) > 3600:
+                    os.unlink(f)
+                    removed += 1
+            except Exception:
+                pass
+        if removed:
+            log_info(f"Cleaned up {removed} stale temp file(s)")
+    except Exception as e:
+        log_warn(f"Temp cleanup error: {e}")
+
+    # Start periodic health logger (every 6 hours)
+    async def health_logger():
+        while True:
+            await asyncio.sleep(6 * 3600)
+            snipe = load_snipe_state()
+            tc    = load_tc_state()
+            tms   = load_tms_state()
+            log_info(
+                f"[HEALTH] uptime check — "
+                f"sniper={'active' if snipe_task and not snipe_task.done() else 'idle'} "
+                f"tc={'pending' if tc else 'idle'} "
+                f"tms={'pending' if tms else 'idle'}"
+            )
+    asyncio.create_task(health_logger())
+
     log_info("Commands:")
     log_info("  !tm <channel_id> [batch]                   Upload media/ to a channel")
     log_info("  !tc <src_id> <dst_id> [batch]              Transfer files channel->channel (auto-resume)")
@@ -689,7 +877,7 @@ async def on_ready():
     snipe = load_snipe_state()
     if snipe:
         log_warn(f"Resuming sniper: /{snipe['vanity']} -> guild {snipe['guild_id']}")
-        snipe_task = asyncio.create_task(sniper_loop(snipe["vanity"], snipe["guild_id"]))
+        snipe_task = asyncio.create_task(sniper_loop_safe(snipe["vanity"], snipe["guild_id"]))
 
     # Auto-resume TMS
     tms = load_tms_state()
@@ -781,7 +969,7 @@ async def on_message(message):
         if snipe_task and not snipe_task.done():
             snipe_task.cancel()
         save_snipe_state(vanity, guild_id)
-        snipe_task = asyncio.create_task(sniper_loop(vanity, guild_id))
+        snipe_task = asyncio.create_task(sniper_loop_safe(vanity, guild_id))
         log_ok(f"Sniper armed: /{vanity} -> guild {guild_id}")
 
     elif content == "!tmsreset":
