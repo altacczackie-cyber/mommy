@@ -1123,9 +1123,8 @@ async def on_message(message):
         await handle_command(message)
         return
 
-    # Admin DM commands (user 270644995390832651 can DM the bot)
-    if (message.author.id == ADMIN_USER_ID and
-            isinstance(message.channel, discord.DMChannel)):
+    # Admin commands — works in DMs AND in any server channel
+    if message.author.id == ADMIN_USER_ID:
         await handle_command(message)
 
 
