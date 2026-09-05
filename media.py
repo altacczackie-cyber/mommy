@@ -17,8 +17,10 @@ TC_STATE_FILE   = "./tc_state.json"
 TMS_STATE_FILE  = "./tms_state.json"
 SNIPE_STATE_FILE = "./snipe_state.json"
 SENT_IDS_FILE   = "./sent_ids.json"   # tracks sent attachment IDs to prevent duplicates
+FAILED_IDS_FILE = "./failed_ids.json"  # tracks permanently failed attachment IDs
 
-MAX_FILE_SIZE   = 500 * 1024 * 1024   # 500 MB
+MAX_FILE_SIZE   = 500 * 1024 * 1024   # 500 MB download limit
+
 MAX_RETRIES     = 5
 ADMIN_USER_ID   = 270644995390832651  # can DM commands to the bot
 
@@ -97,6 +99,25 @@ def save_sent_id(att_id: int):
 def is_sent(att_id: int) -> bool:
     return str(att_id) in load_sent_ids()
 
+def load_failed_ids() -> dict:
+    if os.path.exists(FAILED_IDS_FILE):
+        try:
+            with open(FAILED_IDS_FILE) as f: return json.load(f)
+        except Exception: pass
+    return {}
+
+def record_failure(att_id: int, filename: str) -> int:
+    """Increment failure count for an attachment. Returns new count."""
+    ids = load_failed_ids()
+    key = str(att_id)
+    ids[key] = {"count": ids.get(key, {}).get("count", 0) + 1, "filename": filename}
+    with open(FAILED_IDS_FILE, "w") as f: json.dump(ids, f)
+    return ids[key]["count"]
+
+def is_permanently_failed(att_id: int) -> bool:
+    """True if this attachment has failed 3+ times — skip it."""
+    return load_failed_ids().get(str(att_id), {}).get("count", 0) >= 3
+
 # ── STATE ─────────────────────────────────────────────────────
 
 def _write(path, data):
@@ -143,20 +164,24 @@ def clear_snipe_state(): _del(SNIPE_STATE_FILE)
 async def stream_to_disk(url: str, filename: str, att_id: int = 0):
     """
     Download attachment to a temp file on disk (no RAM bloat).
-    No retry limit — keeps trying until success or URL expiry.
-    Returns (tmp_path, discord.File) or (None, None) if URL is dead.
+    Skips permanently failed attachments (3+ failures).
+    Returns (tmp_path, discord.File) or (None, None).
     """
+    if att_id and is_permanently_failed(att_id):
+        log_warn(f"Permanently skipping {filename} (failed 3+ times before)")
+        return None, None
+
     suffix   = os.path.splitext(filename)[1] or ".bin"
     tmp_path = None
     attempt  = 0
 
-    while True:
+    while attempt < 3:
         try:
             tmp      = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
             tmp_path = tmp.name
             tmp.close()
 
-            # No total timeout — let it stream as long as needed
+            # No total timeout — let it stream as long as needed for large files
             timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as resp:
@@ -166,28 +191,29 @@ async def stream_to_disk(url: str, filename: str, att_id: int = 0):
                             async for chunk in resp.content.iter_chunked(1024 * 512):
                                 f.write(chunk)
                                 size_so_far += len(chunk)
-                        log_info(f"Downloaded {filename} ({size_so_far/1024/1024:.1f} MB)")
-                        wh_info(f"Downloaded `{filename}` ({size_so_far/1024/1024:.1f} MB)")
+                        size_mb = size_so_far / 1024 / 1024
+                        log_info(f"Downloaded {filename} ({size_mb:.1f} MB)")
+                        wh_info(f"Downloaded `{filename}` ({size_mb:.1f} MB)")
                         return tmp_path, discord.File(tmp_path, filename=filename)
 
                     elif resp.status in (403, 404):
-                        # URL expired — can't retry
-                        log_warn(f"Attachment URL expired ({resp.status}): {filename} — skipping")
-                        wh_warn(f"Skipped `{filename}` — URL expired ({resp.status})")
+                        log_warn(f"URL expired ({resp.status}): {filename} — skipping")
+                        wh_warn(f"Skipped `{filename}` — URL expired")
                         if tmp_path and os.path.exists(tmp_path): os.unlink(tmp_path)
+                        if att_id: record_failure(att_id, filename)
                         return None, None
 
                     else:
-                        log_warn(f"HTTP {resp.status} downloading {filename} — retrying...")
+                        log_warn(f"HTTP {resp.status} downloading {filename} — retry {attempt+1}/3")
                         if tmp_path and os.path.exists(tmp_path): os.unlink(tmp_path)
                         await asyncio.sleep(min(2 ** attempt, 60))
                         attempt += 1
                         continue
 
         except asyncio.TimeoutError:
-            log_warn(f"Read timeout on {filename} (attempt {attempt+1}) — retrying...")
+            log_warn(f"Timeout on {filename} — retry {attempt+1}/3")
             if tmp_path and os.path.exists(tmp_path): os.unlink(tmp_path)
-            await asyncio.sleep(min(10 * (attempt + 1), 120))
+            await asyncio.sleep(min(10 * (attempt + 1), 60))
             attempt += 1
 
         except (asyncio.CancelledError, GeneratorExit):
@@ -195,10 +221,16 @@ async def stream_to_disk(url: str, filename: str, att_id: int = 0):
             return None, None
 
         except Exception as e:
-            log_warn(f"Download error {filename} (attempt {attempt+1}): {e}")
+            log_warn(f"Download error {filename} (attempt {attempt+1}/3): {e}")
             if tmp_path and os.path.exists(tmp_path): os.unlink(tmp_path)
             await asyncio.sleep(min(2 ** attempt, 60))
             attempt += 1
+
+    # Permanently failed after 3 attempts
+    fail_count = record_failure(att_id, filename) if att_id else 0
+    log_error(f"Permanently skipping {filename} after 3 failed attempts (total failures: {fail_count})")
+    wh_error(f"Skipping `{filename}` permanently — 3 failed download attempts")
+    return None, None
 
 def cleanup_tmp(*paths):
     for p in paths:
@@ -334,16 +366,23 @@ async def send_media_in_batches(channel, batch_size=1):
     wh_ok(f"Upload to `#{channel.name}` complete — sent: **{uploaded}** | failed: **{failed}**")
 
 # ── TC: CHANNEL TRANSFER ──────────────────────────────────────
+# Phase 1: collect all attachment metadata from history
+# Phase 2: download each file to disk one by one
+# Phase 3: send each file, delete from disk immediately after
+# This avoids OOM — only one file in memory/disk at a time during send
 
 async def run_tc(src, dst, batch_size, resume_after_id=None, already_transferred=0):
     source_id, target_id = src.id, dst.id
-    file_batch, tmp_paths = [], []
     total, skipped = already_transferred, 0
-    last_msg_id = resume_after_id
 
-    msg = f"Transfer `#{src.name}` → `#{dst.name}` (batch={batch_size})" + (f" | resume after `{resume_after_id}`" if resume_after_id else "")
-    log_info(msg)
-    wh_info(msg)
+    header = f"Transfer `#{src.name}` → `#{dst.name}`" + (f" | resume after `{resume_after_id}`" if resume_after_id else "")
+    log_info(header)
+    wh_info(header)
+
+    # ── PHASE 1: collect attachment metadata ──────────────────
+    log_info(f"[TC] Phase 1: scanning #{src.name} for attachments...")
+    wh_info(f"[TC] Scanning `#{src.name}` for attachments...")
+    queue = []  # list of (att_id, url, filename, size_bytes, msg_id)
 
     try:
         kwargs = {"limit": None, "oldest_first": True}
@@ -351,82 +390,97 @@ async def run_tc(src, dst, batch_size, resume_after_id=None, already_transferred
             kwargs["after"] = discord.Object(id=resume_after_id)
 
         async for msg_obj in src.history(**kwargs):
-            msg_files, msg_tmps = [], []
-
             for att in msg_obj.attachments:
-                # Skip already-sent attachments (duplicate prevention)
                 if is_sent(att.id):
-                    log_info(f"Skipping already-sent: {att.filename}")
+                    continue
+                if is_permanently_failed(att.id):
+                    log_warn(f"[TC] Skipping permanently failed: {att.filename}")
+                    skipped += 1
                     continue
                 if att.size > MAX_FILE_SIZE:
-                    log_warn(f"Skipped oversized {att.filename} ({att.size/1024/1024:.1f} MB)")
+                    log_warn(f"[TC] Skipped oversized {att.filename} ({att.size/1024/1024:.1f} MB)")
                     skipped += 1
                     continue
-                log_info(f"Downloading {att.filename} ({att.size/1024/1024:.1f} MB)...")
-                wh_info(f"Downloading `{att.filename}` ({att.size/1024/1024:.1f} MB)")
-                tmp_path, dfile = await stream_to_disk(att.url, att.filename, att.id)
-                if dfile:
-                    msg_files.append((att.id, dfile))
-                    msg_tmps.append(tmp_path)
-                else:
-                    skipped += 1
-
-            file_batch.extend(msg_files)
-            tmp_paths.extend(msg_tmps)
-
-            while len(file_batch) >= batch_size:
-                chunk      = file_batch[:batch_size]
-                chunk_tmps = tmp_paths[:batch_size]
-                file_batch = file_batch[batch_size:]
-                tmp_paths  = tmp_paths[batch_size:]
-                att_ids    = [c[0] for c in chunk]
-                dfiles     = [c[1] for c in chunk]
-                result     = await safe_send(dst, files=dfiles)
-                cleanup_tmp(*chunk_tmps)
-                if result:
-                    total += len(dfiles)
-                    for aid in att_ids:
-                        save_sent_id(aid)
-                    log_ok(f"Sent {len(dfiles)} file(s) (total: {total})")
-                    wh_ok(f"Sent **{len(dfiles)}** file(s) — total: **{total}**")
-                await human_sleep(1.5, 4.0)
-
-            # Checkpoint per message — prevent duplicates on resume
-            last_msg_id = msg_obj.id
-            save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
-
-        # Flush remaining
-        if file_batch:
-            att_ids = [c[0] for c in file_batch]
-            dfiles  = [c[1] for c in file_batch]
-            result  = await safe_send(dst, files=dfiles)
-            cleanup_tmp(*tmp_paths)
-            if result:
-                total += len(dfiles)
-                for aid in att_ids:
-                    save_sent_id(aid)
+                queue.append((att.id, att.url, att.filename, att.size, msg_obj.id))
 
     except discord.Forbidden:
-        log_error("No permission to read source channel — clearing state")
-        wh_error("TC stopped — no permission to read source channel")
-        cleanup_tmp(*tmp_paths)
+        log_error("[TC] No permission to read source channel")
+        wh_error("[TC] No permission to read source channel")
         clear_tc_state()
         return
     except (asyncio.CancelledError, GeneratorExit, Exception) as e:
         if not isinstance(e, Exception):
-            log_warn(f"{type(e).__name__} — saving checkpoint")
+            log_warn(f"[TC] {type(e).__name__} during scan")
         else:
-            log_error(f"TC error: {e}")
+            log_error(f"[TC] Scan error: {e}")
             log_error(traceback.format_exc())
-            wh_error(f"TC error: `{type(e).__name__}: {str(e)[:100]}`")
-        cleanup_tmp(*tmp_paths)
-        save_tc_state(source_id, target_id, batch_size, last_msg_id, total)
-        log_warn("Checkpoint saved — will resume on restart")
+            wh_error(f"[TC] Scan error: `{e}`")
         return
 
+    log_ok(f"[TC] Phase 1 done — {len(queue)} attachment(s) to transfer | {skipped} skipped")
+    wh_ok(f"[TC] Found **{len(queue)}** file(s) to transfer")
+
+    if not queue:
+        clear_tc_state()
+        log_ok("[TC] Nothing to transfer.")
+        return
+
+    # ── PHASE 2+3: download then send immediately, one by one ─
+    log_info(f"[TC] Phase 2: downloading and sending one by one...")
+    wh_info(f"[TC] Starting download + send — **{len(queue)}** file(s)")
+
+    for idx, (att_id, url, filename, size_bytes, msg_id) in enumerate(queue, 1):
+        size_mb  = size_bytes / 1024 / 1024
+        tmp_path = None
+        try:
+            log_info(f"[TC] [{idx}/{len(queue)}] Downloading {filename} ({size_mb:.1f} MB)...")
+            wh_info(f"[TC] [{idx}/{len(queue)}] Downloading `{filename}` ({size_mb:.1f} MB)")
+
+            tmp_path, dfile = await stream_to_disk(url, filename, att_id)
+            if not dfile:
+                skipped += 1
+                log_warn(f"[TC] [{idx}/{len(queue)}] Skipped {filename} — download failed")
+                save_tc_state(source_id, target_id, batch_size, msg_id, total)
+                continue
+
+            log_info(f"[TC] [{idx}/{len(queue)}] Sending {filename}...")
+            result = await safe_send(dst, files=[dfile])
+
+            # Delete temp file immediately after send attempt
+            cleanup_tmp(tmp_path)
+            tmp_path = None
+
+            if result:
+                total += 1
+                save_sent_id(att_id)
+                log_ok(f"[TC] [{idx}/{len(queue)}] Sent {filename} (total: {total})")
+                wh_ok(f"[TC] [{idx}/{len(queue)}] Sent `{filename}` — total: **{total}**")
+            else:
+                skipped += 1
+                fc = record_failure(att_id, filename)
+                log_warn(f"[TC] [{idx}/{len(queue)}] Send failed {filename} (failure #{fc})")
+                wh_warn(f"[TC] Send failed `{filename}` (failure #{fc})")
+
+            # Checkpoint after each file
+            save_tc_state(source_id, target_id, batch_size, msg_id, total)
+            await human_sleep(1.5, 3.0)
+
+        except (asyncio.CancelledError, GeneratorExit):
+            cleanup_tmp(tmp_path)
+            log_warn("[TC] Cancelled — checkpoint saved")
+            save_tc_state(source_id, target_id, batch_size, msg_id, total)
+            return
+        except Exception as e:
+            cleanup_tmp(tmp_path)
+            log_error(f"[TC] Error on {filename}: {e}")
+            log_error(traceback.format_exc())
+            wh_error(f"[TC] Error on `{filename}`: `{e}`")
+            save_tc_state(source_id, target_id, batch_size, msg_id, total)
+            continue  # don't stop — move to next file
+
     clear_tc_state()
-    log_ok(f"TC complete — total: {total} | skipped: {skipped}")
-    wh_ok(f"TC `#{src.name}` → `#{dst.name}` complete — **{total}** sent | **{skipped}** skipped")
+    log_ok(f"[TC] Complete — sent: {total} | skipped: {skipped}")
+    wh_ok(f"[TC] `#{src.name}` → `#{dst.name}` done — **{total}** sent | **{skipped}** skipped")
 
 # ── TMS: MULTI SOURCE ─────────────────────────────────────────
 
@@ -484,93 +538,86 @@ async def run_tms(target_guild, src_ids, start_ch_idx=0, resume_after_msg_id=Non
                 save_tms_state(target_guild.id, src_ids, ch_idx + 1, None, total)
                 continue
 
-        resume_id   = resume_after_msg_id if ch_idx == start_ch_idx else None
-        file_batch  = []
-        tmp_paths   = []
-        last_msg_id = resume_id
-        ch_sent     = 0
-        ch_skipped  = 0
+        resume_id  = resume_after_msg_id if ch_idx == start_ch_idx else None
+        ch_sent    = 0
+        ch_skipped = 0
 
+        # Phase 1: scan channel for attachments
+        log_info(f"[TMS] [{ch_idx+1}/{total_chs}] Scanning #{src.name}...")
+        ch_queue = []
+        last_msg_id = resume_id
         try:
             kwargs = {"limit": None, "oldest_first": True}
             if resume_id:
                 kwargs["after"] = discord.Object(id=resume_id)
-
             async for msg_obj in src.history(**kwargs):
-                msg_files, msg_tmps = [], []
-
                 for att in msg_obj.attachments:
-                    if is_sent(att.id):
-                        log_info(f"  Skipping already-sent: {att.filename}")
+                    if is_sent(att.id) or is_permanently_failed(att.id):
                         continue
                     if att.size > MAX_FILE_SIZE:
-                        log_warn(f"  Skipped oversized {att.filename}")
                         ch_skipped += 1
                         continue
-                    log_info(f"  [{ch_idx+1}/{total_chs}] Downloading {att.filename} ({att.size/1024/1024:.1f} MB)...")
-                    wh_info(f"[{ch_idx+1}/{total_chs}] `#{src.name}` → downloading `{att.filename}` ({att.size/1024/1024:.1f} MB)")
-                    tmp_path, dfile = await stream_to_disk(att.url, att.filename, att.id)
-                    if dfile:
-                        msg_files.append((att.id, dfile))
-                        msg_tmps.append(tmp_path)
-                    else:
-                        ch_skipped += 1
-
-                file_batch.extend(msg_files)
-                tmp_paths.extend(msg_tmps)
-
-                while len(file_batch) >= 5:
-                    chunk      = file_batch[:5]
-                    chunk_tmps = tmp_paths[:5]
-                    file_batch = file_batch[5:]
-                    tmp_paths  = tmp_paths[5:]
-                    att_ids    = [c[0] for c in chunk]
-                    dfiles     = [c[1] for c in chunk]
-                    result     = await safe_send(dst, files=dfiles)
-                    cleanup_tmp(*chunk_tmps)
-                    if result:
-                        ch_sent += len(dfiles)
-                        total   += len(dfiles)
-                        for aid in att_ids:
-                            save_sent_id(aid)
-                        log_ok(f"  [{ch_idx+1}/{total_chs}] Sent {len(dfiles)} file(s) — ch total: {ch_sent}")
-                        wh_ok(f"[{ch_idx+1}/{total_chs}] `#{src.name}` sent **{len(dfiles)}** file(s) — total: **{total}**")
-                    await human_sleep(1.5, 4.0)
-
-                last_msg_id = msg_obj.id
-                save_tms_state(target_guild.id, src_ids, ch_idx, last_msg_id, total)
-
-            # Flush remaining
-            if file_batch:
-                att_ids = [c[0] for c in file_batch]
-                dfiles  = [c[1] for c in file_batch]
-                result  = await safe_send(dst, files=dfiles)
-                cleanup_tmp(*tmp_paths)
-                if result:
-                    ch_sent += len(dfiles)
-                    total   += len(dfiles)
-                    for aid in att_ids:
-                        save_sent_id(aid)
-                file_batch, tmp_paths = [], []
-
+                    ch_queue.append((att.id, att.url, att.filename, att.size, msg_obj.id))
         except discord.Forbidden:
-            log_error(f"No read permission for #{src.name} — skipping channel")
-            wh_warn(f"No read permission for `#{src.name}` — skipping")
-            cleanup_tmp(*tmp_paths)
+            log_error(f"[TMS] No read permission for #{src.name} — skipping")
+            wh_warn(f"[TMS] No read permission for `#{src.name}` — skipping")
             save_tms_state(target_guild.id, src_ids, ch_idx + 1, None, total)
             resume_after_msg_id = None
             await human_sleep(2.0, 5.0)
             continue
         except (asyncio.CancelledError, GeneratorExit, Exception) as e:
             if not isinstance(e, Exception):
-                log_warn(f"{type(e).__name__} in TMS — checkpoint saved")
+                log_warn(f"[TMS] {type(e).__name__} during scan")
             else:
-                log_error(f"TMS error on #{src.name}: {e}")
-                log_error(traceback.format_exc())
-                wh_error(f"TMS error on `#{src.name}`: `{type(e).__name__}: {str(e)[:100]}`")
-            cleanup_tmp(*tmp_paths)
+                log_error(f"[TMS] Scan error: {e}")
+                wh_error(f"[TMS] Scan error `#{src.name}`: `{e}`")
             save_tms_state(target_guild.id, src_ids, ch_idx, last_msg_id, total)
             return
+
+        log_ok(f"[TMS] [{ch_idx+1}/{total_chs}] #{src.name} — {len(ch_queue)} file(s) to send")
+        wh_ok(f"[TMS] [{ch_idx+1}/{total_chs}] `#{src.name}` — **{len(ch_queue)}** file(s) found")
+
+        # Phase 2+3: download one → send → delete → next
+        for f_idx, (att_id, url, filename, size_bytes, msg_id) in enumerate(ch_queue, 1):
+            tmp_path = None
+            try:
+                size_mb = size_bytes / 1024 / 1024
+                log_info(f"[TMS] [{ch_idx+1}/{total_chs}] [{f_idx}/{len(ch_queue)}] Downloading {filename} ({size_mb:.1f} MB)...")
+                wh_info(f"[TMS] [{ch_idx+1}/{total_chs}] Downloading `{filename}` ({size_mb:.1f} MB)")
+
+                tmp_path, dfile = await stream_to_disk(url, filename, att_id)
+                if not dfile:
+                    ch_skipped += 1
+                    save_tms_state(target_guild.id, src_ids, ch_idx, msg_id, total)
+                    continue
+
+                result = await safe_send(dst, files=[dfile])
+                cleanup_tmp(tmp_path)
+                tmp_path = None
+
+                if result:
+                    ch_sent += 1
+                    total   += 1
+                    save_sent_id(att_id)
+                    log_ok(f"[TMS] [{ch_idx+1}/{total_chs}] [{f_idx}/{len(ch_queue)}] Sent {filename} (total: {total})")
+                    wh_ok(f"[TMS] [{ch_idx+1}/{total_chs}] Sent `{filename}` — total: **{total}**")
+                else:
+                    ch_skipped += 1
+                    record_failure(att_id, filename)
+
+                save_tms_state(target_guild.id, src_ids, ch_idx, msg_id, total)
+                await human_sleep(1.5, 3.0)
+
+            except (asyncio.CancelledError, GeneratorExit):
+                cleanup_tmp(tmp_path)
+                save_tms_state(target_guild.id, src_ids, ch_idx, msg_id, total)
+                return
+            except Exception as e:
+                cleanup_tmp(tmp_path)
+                log_error(f"[TMS] Error on {filename}: {e}")
+                wh_error(f"[TMS] Error on `{filename}`: `{e}`")
+                save_tms_state(target_guild.id, src_ids, ch_idx, msg_id, total)
+                continue  # move to next file, never stop
 
         log_ok(f"[{ch_idx+1}/{total_chs}] #{src.name} done — sent: {ch_sent} | skipped: {ch_skipped}")
         wh_ok(f"[{ch_idx+1}/{total_chs}] `#{src.name}` done — **{ch_sent}** sent | **{ch_skipped}** skipped")
@@ -898,37 +945,9 @@ async def on_ready():
         wh_warn(f"Resuming sniper: `discord.gg/{snipe['vanity']}`")
         snipe_task = asyncio.create_task(sniper_loop_safe(snipe["vanity"], snipe["guild_id"]))
 
-    # Auto-resume TMS
-    tms = load_tms_state()
-    if tms:
-        log_warn(f"Auto-resuming TMS: guild={tms['target_guild_id']} ch={tms['channel_index']} sent={tms['transferred']}")
-        wh_warn(f"Resuming TMS from channel index **{tms['channel_index']}** — already sent: **{tms['transferred']}**")
-        await asyncio.sleep(3)
-        g = bot.get_guild(tms["target_guild_id"])
-        if not g:
-            log_error("TMS guild not found — clearing state")
-            clear_tms_state()
-        else:
-            asyncio.create_task(run_tms(g, tms["src_ids"],
-                                        start_ch_idx=tms["channel_index"],
-                                        resume_after_msg_id=tms["last_message_id"],
-                                        already_transferred=tms["transferred"]))
+    # TMS auto-resume disabled — use !tms manually to restart
 
-    # Auto-resume TC
-    tc = load_tc_state()
-    if tc:
-        log_warn(f"Auto-resuming TC: #{tc['source_id']} → #{tc['target_id']} sent={tc['transferred']}")
-        wh_warn(f"Resuming TC — already sent: **{tc['transferred']}**")
-        await asyncio.sleep(3)
-        src = find_channel_by_id(tc["source_id"])
-        dst = find_channel_by_id(tc["target_id"])
-        if not src or not dst:
-            log_error("TC channel(s) not found — clearing state")
-            clear_tc_state()
-        else:
-            asyncio.create_task(run_tc(src, dst, tc["batch_size"],
-                                       resume_after_id=tc["last_message_id"],
-                                       already_transferred=tc["transferred"]))
+    # TC auto-resume disabled — use !tc manually to restart
 
 @bot.event
 async def on_error(event, *args, **kwargs):
